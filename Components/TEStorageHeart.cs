@@ -9,7 +9,6 @@ using Terraria.ModLoader.IO;
 using System.Collections.Concurrent;
 using System.Reflection;
 using Terraria.ModLoader.Default;
-using XPT.Core.Audio.MP3Sharp.Decoding;
 using Terraria.Localization;
 using Microsoft.Xna.Framework;
 
@@ -495,8 +494,10 @@ namespace MagicStorage.Components
 
 		public void DepositItem(Item toDeposit)
 		{
-			if (!toDeposit.IsAir)
+			if (!toDeposit.IsAir) {
 				StorageGUI.SetNextItemTypeToRefresh(toDeposit.type);
+				CraftingGUI.SetNextDefaultRecipeCollectionToRefresh(toDeposit.type);
+			}
 
 			int oldStack = toDeposit.stack;
 			int remember = toDeposit.type;
@@ -597,6 +598,7 @@ namespace MagicStorage.Components
 							result.stack += withdrawn.stack;
 
 						StorageGUI.SetNextItemTypeToRefresh(withdrawn.type);
+						CraftingGUI.SetNextDefaultRecipeCollectionToRefresh(withdrawn.type);
 
 						if (lookFor.stack <= 0)
 						{
@@ -660,6 +662,7 @@ namespace MagicStorage.Components
 						ResetCompactStage();
 						StorageGUI.SetRefresh();
 						StorageGUI.SetNextItemTypeToRefresh(type);
+						CraftingGUI.SetNextDefaultRecipeCollectionToRefresh(type);
 					}
 				}
 			} catch {

@@ -5,7 +5,7 @@ using Terraria;
 
 namespace MagicStorage.Common.Systems.RecurrentRecipes {
 	public sealed class RecipeIngredientInfo {
-		public readonly Recipe sourceRecipe;
+		public readonly RecipeInfo parent;
 
 		public readonly int recipeIngredientIndex;
 
@@ -27,15 +27,15 @@ namespace MagicStorage.Common.Systems.RecurrentRecipes {
 		/// </summary>
 		public int RecipeCount => trees.Count;
 
-		internal RecipeIngredientInfo(Recipe recipe, int index) {
-			sourceRecipe = recipe;
+		internal RecipeIngredientInfo(RecipeInfo recipeInfo, int index) {
+			parent = recipeInfo;
 			recipeIngredientIndex = index;
 
 			// Account for recipe groups as well
-			int recipeItem = recipe.requiredItem[index].type;
+			int recipeItem = recipeInfo.sourceRecipe.requiredItem[index].type;
 			HashSet<int> types = new() { recipeItem };
 
-			foreach (int id in recipe.acceptedGroups) {
+			foreach (int id in recipeInfo.sourceRecipe.acceptedGroups) {
 				RecipeGroup group = RecipeGroup.recipeGroups[id];
 				if (group.ContainsItem(recipeItem))
 					types.UnionWith(group.ValidItems);
@@ -49,6 +49,69 @@ namespace MagicStorage.Common.Systems.RecurrentRecipes {
 
 		public void SetRecipe(int index = -1) {
 			_selectedRecipe = index < 0 || index >= trees.Count ? 0 : index;
+		}
+
+		/// <summary>
+		/// Attempts to update <see cref="SelectedRecipe"/> depending on which possible recipe's ingredients requirement was satisfied the most.<br/>
+		/// If no recipe was found as a "best match", <see cref="SelectedRecipe"/> is not updated
+		/// </summary>
+		/// <param name="availableInventory">A collection of item quantities, indexed by type.  If <see langword="null"/>, <see cref="SelectedRecipe"/> is not updated</param>
+		public void FindBestMatchAndSetRecipe(Dictionary<int, int> availableInventory) {
+			if (availableInventory is null)
+				return;
+
+			// Attempt to find the recipe with the best "availability", i.e. the recipe that has the most ingredients partially or fully satisfied
+			// If one exists, modify the "_selectedRecipe" index to that recipe.  Otherwise, don't modify it
+			int bestMatch = -1;
+			float bestPercent = 0;
+
+			for (int i = 0; i < trees.Count; i++) {
+				Recipe subrecipe = trees[i].originalRecipe;
+
+				float percent = 0;
+				foreach (Item item in subrecipe.requiredItem) {
+					bool usedRecipeGroup = false;
+					ClampedArithmetic stack = item.stack;
+
+					int count;
+					foreach (int groupID in subrecipe.acceptedGroups) {
+						RecipeGroup group = RecipeGroup.recipeGroups[groupID];
+
+						// Attempt to use items that are valid in the group
+						if (group.ContainsItem(item.type)) {
+							foreach (int groupItem in group.ValidItems) {
+								if (availableInventory.TryGetValue(item.type, out count)) {
+									usedRecipeGroup = true;
+									stack -= count;
+
+									if (stack <= 0)
+										goto checkNonRecipeGroup;
+								}
+							}
+						}
+					}
+
+					checkNonRecipeGroup:
+
+					if (!usedRecipeGroup && availableInventory.TryGetValue(item.type, out count))
+						stack -= count;
+
+					if (stack < 0)
+						stack = 0;
+
+					float stackConsumedFactor = (float)(item.stack - stack) / item.stack;
+					percent += stackConsumedFactor / subrecipe.requiredItem.Count;
+				}
+
+				if (percent > bestPercent) {
+					bestMatch = i;
+					bestPercent = percent;
+				}
+			}
+
+			// Update the initially selected recipe
+			if (bestMatch >= 0)
+				_selectedRecipe = bestMatch;
 		}
 	}
 }

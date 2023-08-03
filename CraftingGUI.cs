@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using MagicStorage.Common;
 using MagicStorage.Common.Systems;
 using MagicStorage.Common.Systems.RecurrentRecipes;
 using MagicStorage.Components;
@@ -18,6 +19,7 @@ using Terraria.DataStructures;
 using Terraria.ID;
 using Terraria.Localization;
 using Terraria.ModLoader;
+using Terraria.UI;
 
 namespace MagicStorage
 {
@@ -60,8 +62,10 @@ namespace MagicStorage
 
 		internal static int maxRightClickTimer = StartMaxRightClickTimer;
 
+		[ThreadStatic]
 		public static bool CatchDroppedItems;
-		public static List<Item> DroppedItems = new();
+		[ThreadStatic]
+		public static List<Item> DroppedItems;
 
 		private static bool[] adjTiles = new bool[TileLoader.TileCount];
 		private static bool adjWater;
@@ -119,23 +123,30 @@ namespace MagicStorage
 			int totalGroupStack = 0;
 			Item storageItem = storageItems.FirstOrDefault(i => i.type == item.type) ?? new Item();
 
-			foreach (RecipeGroup rec in selectedRecipe.acceptedGroups.Select(index => RecipeGroup.recipeGroups[index]))
-				if (rec.ValidItems.Contains(item.type))
+			foreach (RecipeGroup rec in selectedRecipe.acceptedGroups.Select(index => RecipeGroup.recipeGroups[index])) {
+				if (rec.ValidItems.Contains(item.type)) {
 					foreach (int type in rec.ValidItems)
 						totalGroupStack += storageItems.Where(i => i.type == type).Sum(i => i.stack);
+				}
+			}
 
-			if (!item.IsAir)
-			{
+			if (!item.IsAir) {
 				if (storageItem.IsAir && totalGroupStack == 0)
-					context = 3; // Unavailable - Red // ItemSlot.Context.ChestItem
+					context = ItemSlot.Context.ChestItem;  // Unavailable - Red
 				else if (storageItem.stack < item.stack && totalGroupStack < item.stack)
-					context = 4; // Partially in stock - Pinkish // ItemSlot.Context.BankItem
+					context = ItemSlot.Context.BankItem;  // Partially in stock - Pinkish
+
 				// context == 0 - Available - Default Blue
-				if (context != 0)
-				{
-					bool craftable = MagicCache.ResultToRecipe.TryGetValue(item.type, out var r) && r.Any(recipe => AmountCraftable(recipe) > 0);
+				if (context != 0) {
+					bool craftable;
+
+					using (FlagSwitch.ToggleTrue(ref disableNetPrintingForIsAvailable)) {
+						// Forcibly prevent any subrecipes using this item type from being "available"
+						craftable = MagicCache.ResultToRecipe.TryGetValue(item.type, out var r) && r.Any(recipe => IsAvailable(recipe, true, selectedRecipe.createItem.type));
+					}
+
 					if (craftable)
-						context = 6; // Craftable - Light green // ItemSlot.Context.TrashItem
+						context = ItemSlot.Context.TrashItem;  // Craftable - Light green
 				}
 			}
 
@@ -155,28 +166,53 @@ namespace MagicStorage
 			return false;
 		}
 
+		private static int? amountCraftableForCurrentRecipe;
+		private static Recipe recentRecipeAmountCraftable;
+
+		public static int AmountCraftableForCurrentRecipe() {
+			if (currentlyThreading || StorageGUI.CurrentlyRefreshing)
+				return 0;  // Delay logic until threading stops
+
+			if (object.ReferenceEquals(recentRecipeAmountCraftable, selectedRecipe) && amountCraftableForCurrentRecipe is { } amount)
+				return amount;
+
+			// Calculate the value
+			recentRecipeAmountCraftable = selectedRecipe;
+			amountCraftableForCurrentRecipe = amount = AmountCraftable(selectedRecipe);
+			return amount;
+		}
+
+		internal static bool requestingAmountFromUI;
+
 		// Calculates how many times a recipe can be crafted using available items
-		// TODO is this correct?
 		internal static int AmountCraftable(Recipe recipe)
 		{
+			if (MagicStorageConfig.IsRecursionEnabled && recipe.TryGetRecursiveRecipe(out RecursiveRecipe recursiveRecipe)) {
+				using (FlagSwitch.ToggleTrue(ref requestingAmountFromUI))
+					return recursiveRecipe.GetMaxCraftable(GetItemCountsWithBlockedItemsRemoved());
+			}
+
+			// Handle the old logic
 			if (!IsAvailable(recipe))
 				return 0;
-			int maxCraftable = int.MaxValue;
 
-			int GetMaxCraftsAmount(Item requiredItem)
-			{
+			// Local capturing
+			Recipe r = recipe;
+
+			int GetMaxCraftsAmount(Item requiredItem) {
 				int total = 0;
-				foreach (Item inventoryItem in items)
-					if (inventoryItem.type == requiredItem.type || RecipeGroupMatch(recipe, inventoryItem.type, requiredItem.type))
+				foreach (Item inventoryItem in items) {
+					if (inventoryItem.type == requiredItem.type || RecipeGroupMatch(r, inventoryItem.type, requiredItem.type))
 						total += inventoryItem.stack;
+				}
 
 				int craftable = total / requiredItem.stack;
 				return craftable;
 			}
 
-			maxCraftable = recipe.requiredItem.Select(GetMaxCraftsAmount).Prepend(maxCraftable).Min();
+			int maxCrafts = recipe.requiredItem.Select(GetMaxCraftsAmount).Prepend(int.MaxValue).Min();
 
-			return maxCraftable * recipe.createItem.stack;
+			return maxCrafts * recipe.createItem.stack;
 		}
 
 		internal static Item GetResult(int slot, ref int context) => slot == 0 && result is not null ? result : new Item();
@@ -223,16 +259,17 @@ namespace MagicStorage
 		}
 
 		internal static void ClampCraftAmount() {
-			if (craftAmountTarget < 1) 
+			if (craftAmountTarget < 1)
 				craftAmountTarget = 1;
-			else if (!IsAvailable(selectedRecipe, false) || !PassesBlock(selectedRecipe)) 
+			else if (selectedRecipe?.createItem.maxStack == 1 || !IsCurrentRecipeFullyAvailable())
 				craftAmountTarget = 1;
-			else if (craftAmountTarget > selectedRecipe.createItem.maxStack)
-			{ 
-				int amountCraftable = AmountCraftable(selectedRecipe); 
-				craftAmountTarget = amountCraftable < selectedRecipe.createItem.maxStack 
-					? amountCraftable
-					: selectedRecipe.createItem.maxStack;
+			else
+			{
+				int amountCraftable = AmountCraftableForCurrentRecipe();
+				int max = Utils.Clamp(amountCraftable, 1, selectedRecipe.createItem.maxStack);
+
+				if (craftAmountTarget > max)
+					craftAmountTarget = max;
 			}
 		}
 
@@ -278,7 +315,7 @@ namespace MagicStorage
 
 			recipesToRefresh = recipesToRefresh.Concat(recipes).DistinctBy(static r => r, ReferenceEqualityComparer.Instance).ToArray();
 
-			NetHelper.Report(true, $"Setting next refresh to check {recipes.Length} recipes");
+			NetHelper.Report(true, $"Setting next refresh to check {recipesToRefresh.Length} recipes");
 		}
 
 		/// <summary>
@@ -337,6 +374,9 @@ namespace MagicStorage
 				StorageGUI.activeThread = null;
 			}
 
+			// Always reset the cached values
+			ResetRecentRecipeCache();
+
 			items.Clear();
 			sourceItems.Clear();
 			numItemsWithoutSimulators = 0;
@@ -362,9 +402,6 @@ namespace MagicStorage
 				.Where(i => i.type > ItemID.None && i.stack > 0)
 				.DistinctBy(i => i, ReferenceEqualityComparer.Instance);  //Filter by distinct object references (prevents "duplicate" items from, say, 2 mods adding items from the player's inventory)
 
-			//Keep the simulator items separate
-			ItemSorter.AggregateContext context = new(heartItems);
-			
 			int sortMode = MagicUI.craftingUI.GetPage<SortingPage>("Sorting").option;
 			int filterMode = MagicUI.craftingUI.GetPage<FilteringPage>("Filtering").option;
 
@@ -426,6 +463,8 @@ namespace MagicStorage
 
 		private static void SortAndFilter(StorageGUI.ThreadContext thread) {
 			currentlyThreading = true;
+
+			currentRecipeIsAvailable = null;
 
 			if (thread.state is ThreadState state) {
 				LoadStoredItems(thread, state);
@@ -586,17 +625,19 @@ namespace MagicStorage
 				recipes.Clear();
 				recipeAvailable.Clear();
 
-				if (state.recipeFilterChoice == RecipeButtonsAvailableChoice)
-				{
-					NetHelper.Report(true, "Filtering out only available recipes...");
+				using (FlagSwitch.ToggleTrue(ref disableNetPrintingForIsAvailable)) {
+					if (state.recipeFilterChoice == RecipeButtonsAvailableChoice)
+					{
+						NetHelper.Report(true, "Filtering out only available recipes...");
 
-					recipes.AddRange(sortedRecipes.Where(r => IsAvailable(r)));
-					recipeAvailable.AddRange(Enumerable.Repeat(true, recipes.Count));
-				}
-				else
-				{
-					recipes.AddRange(sortedRecipes);
-					recipeAvailable.AddRange(recipes.AsParallel().AsOrdered().Select(r => IsAvailable(r)));
+						recipes.AddRange(sortedRecipes.Where(r => IsAvailable(r)));
+						recipeAvailable.AddRange(Enumerable.Repeat(true, recipes.Count));
+					}
+					else
+					{
+						recipes.AddRange(sortedRecipes);
+						recipeAvailable.AddRange(recipes.AsParallel().AsOrdered().Select(r => IsAvailable(r)));
+					}
 				}
 			} catch when (thread.token.IsCancellationRequested) {
 				recipes.Clear();
@@ -619,28 +660,30 @@ namespace MagicStorage
 
 				int index = recipes.IndexOf(check);  // TODO: check.RecipeIndex?
 
-				if (!IsAvailable(check)) {
-					if (index >= 0) {
-						if (state.recipeFilterChoice == RecipeButtonsAvailableChoice) {
-							//Remove the recipe
-							recipes.RemoveAt(index);
-							recipeAvailable.RemoveAt(index);
-						} else {
-							//Simply mark the recipe as unavailable
-							recipeAvailable[index] = false;
-						}
-					}
-				} else {
-					if (state.recipeFilterChoice == RecipeButtonsAvailableChoice) {
-						if (index < 0 && CanBeAdded(thread, state, orig)) {
-							//Add the recipe
-							recipes.Add(orig);
-							needsResort = true;
+				using (FlagSwitch.ToggleTrue(ref disableNetPrintingForIsAvailable)) {
+					if (!IsAvailable(check)) {
+						if (index >= 0) {
+							if (state.recipeFilterChoice == RecipeButtonsAvailableChoice) {
+								//Remove the recipe
+								recipes.RemoveAt(index);
+								recipeAvailable.RemoveAt(index);
+							} else {
+								//Simply mark the recipe as unavailable
+								recipeAvailable[index] = false;
+							}
 						}
 					} else {
-						if (index >= 0) {
-							//Simply mark the recipe as available
-							recipeAvailable[index] = true;
+						if (state.recipeFilterChoice == RecipeButtonsAvailableChoice) {
+							if (index < 0 && CanBeAdded(thread, state, orig)) {
+								//Add the recipe
+								recipes.Add(orig);
+								needsResort = true;
+							}
+						} else {
+							if (index >= 0) {
+								//Simply mark the recipe as available
+								recipeAvailable[index] = true;
+							}
 						}
 					}
 				}
@@ -827,8 +870,185 @@ namespace MagicStorage
 			adjTiles = information.adjTiles;
 		}
 
-		public static bool IsAvailable(Recipe recipe, bool checkCompound = true)
+		private static bool? currentRecipeIsAvailable;
+		private static Recipe recentRecipeAvailable;
+
+		/// <summary>
+		/// Returns <see langword="true"/> if the current recipe is available and passes the "blocked ingredients" filter
+		/// </summary>
+		public static bool IsCurrentRecipeFullyAvailable() {
+			if (currentlyThreading || StorageGUI.CurrentlyRefreshing)
+				return false;  // Delay logic until threading stops
+
+			if (object.ReferenceEquals(recentRecipeAvailable, selectedRecipe) && currentRecipeIsAvailable is { } available)
+				return available;
+
+			// Calculate the value
+			recentRecipeAvailable = selectedRecipe;
+			currentRecipeIsAvailable = available = IsAvailable(selectedRecipe) && PassesBlock(selectedRecipe);
+			return available;
+		}
+
+		public static void ResetRecentRecipeCache() {
+			recentRecipeAvailable = null;
+			currentRecipeIsAvailable = null;
+			recentRecipeAmountCraftable = null;
+			amountCraftableForCurrentRecipe = null;
+		}
+
+		/// <summary>
+		/// Returns the recursion crafting tree for <paramref name="recipe"/> if it exists and recursion is enabled, or <see langword="null"/> otherwise.
+		/// </summary>
+		/// <param name="recipe">The recipe</param>
+		/// <param name="toCraft">The quantity of the final recipe's crafted item to create</param>
+		/// <param name="blockedSubrecipeIngredient">An optional item ID representing ingredient trees that should be ignored</param>
+		public static OrderedRecipeTree GetCraftingTree(Recipe recipe, int toCraft = 1, int blockedSubrecipeIngredient = 0) {
+			if (!MagicStorageConfig.IsRecursionEnabled || !recipe.TryGetRecursiveRecipe(out RecursiveRecipe recursiveRecipe))
+				return null;
+
+			return recursiveRecipe.GetCraftingTree(toCraft, availableInventory: GetItemCountsWithBlockedItemsRemoved(), blockedSubrecipeIngredient);
+		}
+
+		internal static bool disableNetPrintingForIsAvailable;
+
+		public static bool IsAvailable(Recipe recipe, bool checkRecursive = true) => IsAvailable(recipe, checkRecursive, recipe?.createItem.type ?? 0);
+
+		private static bool IsAvailable(Recipe recipe, bool checkRecursive, int ignoreItem)
 		{
+			if (recipe is null)
+				return false;
+
+			if (!disableNetPrintingForIsAvailable) {
+				NetHelper.Report(true, "Checking if recipe is available...");
+
+				if (checkRecursive)
+					NetHelper.Report(false, "Calculating recursion tree for recipe...");
+			}
+
+			bool available;
+			if (checkRecursive && GetCraftingTree(recipe, blockedSubrecipeIngredient: ignoreItem) is OrderedRecipeTree craftingTree) {
+				// NOTE: [ThreadStatic] only runs the field initializer on one thread
+				DroppedItems ??= new();
+
+				// Clone the item counts so that the inventory can be faked
+				isAvailable_ItemCountsDictionary = GetItemCountsWithBlockedItemsRemoved(cloneIfBlockEmpty: true);
+
+				if (ignoreItem > 0)
+					isAvailable_ItemCountsDictionary.Remove(ignoreItem);
+
+				craftingTree.TrimBranches(IsAvailable_GetItemCount);
+
+				// Put all remaining recipes on a stack, and then process them in that order
+				// If any recipe ends up not being fulfilled, the original recipe will not be available
+				Stack<OrderedRecipeContext> recipeStack = craftingTree.GetProcessingOrder();
+
+				// Check each recipe, then update item count dictionary with its ingredients and result
+				var heart = GetHeart();
+				EnvironmentSandbox sandbox = new EnvironmentSandbox(Main.LocalPlayer, heart);
+				IEnumerable<EnvironmentModule> modules = heart.GetModules();
+
+				if (!disableNetPrintingForIsAvailable)
+					NetHelper.Report(true, "Processing recipe order...");
+
+				available = true;
+				foreach (OrderedRecipeContext context in recipeStack) {
+					// Trimmed branch?  Ignore, assume available
+					if (context.amountToCraft <= 0)
+						continue;
+
+					int batches = (int)Math.Ceiling(context.amountToCraft / (double)context.recipe.createItem.stack);
+
+					if (!IsAvailable_CheckRecipe(context.recipe, batches)) {
+						available = false;
+						break;
+					}
+
+					// Remove the required items from the inventory
+					IsAvailable_ConsumeFakeCounts(context, batches, out Dictionary<int, int> consumedItemCounts);
+
+					// Fake the crafts
+					CatchDroppedItems = true;
+					DroppedItems.Clear();
+
+					List<Item> consumedItems = consumedItemCounts.Select(kvp => new Item(kvp.Key, kvp.Value)).ToList();
+
+					Item createItem = context.recipe.createItem;
+					Item clonedItem = createItem.Clone();
+
+					for (int i = 0; i < batches; i++) {
+						RecipeLoader.OnCraft(clonedItem, context.recipe, consumedItems);
+
+						foreach (EnvironmentModule module in modules)
+							module.OnConsumeItemsForRecipe(sandbox, context.recipe, consumedItems);
+					}
+
+					CatchDroppedItems = false;
+
+					// Add the "results" and extra items to the inventory
+					isAvailable_ItemCountsDictionary.AddOrSumCount(createItem.type, createItem.stack * batches);
+
+					foreach (Item droppedItem in DroppedItems)
+						isAvailable_ItemCountsDictionary.AddOrSumCount(droppedItem.type, droppedItem.stack);
+				}
+			} else {
+				isAvailable_ItemCountsDictionary = GetItemCountsWithBlockedItemsRemoved();
+				available = IsAvailable_CheckRecipe(recipe);
+				isAvailable_ItemCountsDictionary = null;
+			}
+
+			if (!disableNetPrintingForIsAvailable)
+				NetHelper.Report(true, $"Recipe {(available ? "was" : "was not")} available");
+
+			return available;
+		}
+
+		private static void IsAvailable_ConsumeFakeCounts(OrderedRecipeContext context, int batches, out Dictionary<int, int> consumedItemCounts) {
+			consumedItemCounts = new();
+
+			foreach (Item item in context.recipe.requiredItem) {
+				int count = isAvailable_ItemCountsDictionary.TryGetValue(item.type, out int c) ? c : 0;
+				int consume = item.stack * batches;
+
+				if (count >= consume) {
+					isAvailable_ItemCountsDictionary[item.type] = count - consume;
+					consumedItemCounts.AddOrSumCount(item.type, consume);
+				} else {
+					// Item would be wholly consumed
+					if (count > 0) {
+						consume -= count;
+						isAvailable_ItemCountsDictionary.Remove(item.type);
+						consumedItemCounts.AddOrSumCount(item.type, count);
+					}
+
+					// Check for recipe groups
+					foreach (int groupID in context.recipe.acceptedGroups) {
+						RecipeGroup group = RecipeGroup.recipeGroups[groupID];
+						if (group.ContainsItem(item.type)) {
+							// Check each valid item in the group
+							foreach (int groupItem in group.ValidItems) {
+								count = isAvailable_ItemCountsDictionary.TryGetValue(groupItem, out c) ? c : 0;
+
+								if (count >= consume) {
+									// Nothing left to consume
+									isAvailable_ItemCountsDictionary[groupItem] = count - consume;
+									consumedItemCounts.AddOrSumCount(groupItem, consume);
+									goto afterGroupCheck;
+								} else if (count > 0) {
+									// Item would be wholly consumed
+									consume -= count;
+									isAvailable_ItemCountsDictionary.Remove(groupItem);
+									consumedItemCounts.AddOrSumCount(groupItem, count);
+								}
+							}
+						}
+					}
+
+					afterGroupCheck: ;
+				}
+			}
+		}
+
+		private static bool IsAvailable_CheckRecipe(Recipe recipe, int batches = 1) {
 			if (recipe is null)
 				return false;
 
@@ -837,19 +1057,7 @@ namespace MagicStorage
 
 			foreach (Item ingredient in recipe.requiredItem)
 			{
-				int stack = ingredient.stack;
-				bool useRecipeGroup = false;
-				foreach (var (type, count) in itemCounts)
-					if (RecipeGroupMatch(recipe, type, ingredient.type))
-					{
-						stack -= count;
-						useRecipeGroup = true;
-					}
-
-				if (!useRecipeGroup && itemCounts.TryGetValue(ingredient.type, out int amount))
-					stack -= amount;
-
-				if (stack > 0)
+				if (ingredient.stack * batches - IsAvailable_GetItemCount(recipe, ingredient.type) > 0)
 					return false;
 			}
 
@@ -864,6 +1072,26 @@ namespace MagicStorage
 			});
 
 			return retValue;
+		}
+
+		// Prevents multiple threads from trying to manipulate the same object
+		[ThreadStatic]
+		private static Dictionary<int, int> isAvailable_ItemCountsDictionary;
+
+		private static int IsAvailable_GetItemCount(Recipe recipe, int type) {
+			ClampedArithmetic count = 0;
+			bool useRecipeGroup = false;
+			foreach (var (item, quantity) in isAvailable_ItemCountsDictionary) {
+				if (RecipeGroupMatch(recipe, item, type)) {
+					count += quantity;
+					useRecipeGroup = true;
+				}
+			}
+
+			if (!useRecipeGroup && isAvailable_ItemCountsDictionary.TryGetValue(type, out int amount))
+				count += amount;
+
+			return count;
 		}
 
 		public class PlayerZoneCache {
@@ -933,39 +1161,155 @@ namespace MagicStorage
 				player.ZoneGraveyard = graveyard;
 
 				action();
+			} finally {
+				PlayerZoneCache.FreeCache(false);
 			}
-			finally { }
 		}
+
+		private static List<ItemInfo> storageItemInfo;
 
 		internal static bool PassesBlock(Recipe recipe)
 		{
-			foreach (Item ingredient in recipe.requiredItem)
-			{
+			if (recipe is null || storageItemInfo is null)
+				return false;
+
+			NetHelper.Report(true, "Checking if recipe passes \"blocked ingredients\" check...");
+
+			if (GetCraftingTree(recipe) is OrderedRecipeTree craftingTree) {
+				isAvailable_ItemCountsDictionary = GetItemCountsWithBlockedItemsRemoved();
+				craftingTree.TrimBranches(IsAvailable_GetItemCount);
+				isAvailable_ItemCountsDictionary = null;
+
+				// Data list will need to be modified.  Cache the old value
+				List<ItemInfo> oldInfo = new List<ItemInfo>(storageItemInfo);
+
+				Stack<OrderedRecipeContext> recipeStack = craftingTree.GetProcessingOrder();
+
+				foreach (OrderedRecipeContext context in recipeStack) {
+					// Trimmed branch?  Ignore
+					if (context.amountToCraft <= 0)
+						continue;
+
+					Recipe contextRecipe = context.recipe;
+
+					if (!PassesBlock_CheckRecipe(contextRecipe, consumeStoredItems: true)) {
+						storageItemInfo = oldInfo;
+						NetHelper.Report(true, "Recipe failed the ingredients check");
+						return false;
+					}
+
+					// Add the result items to the list
+					Item resultItem = contextRecipe.createItem.Clone();
+					resultItem.stack = context.amountToCraft;
+					resultItem.Prefix(-1);
+
+					int resultStack = resultItem.stack;
+
+					for (int i = 0; i < storageItemInfo.Count; i++) {
+						ItemInfo info = storageItemInfo[i];
+
+						if (info.type == resultItem.type && info.prefix == resultItem.prefix && info.stack < resultItem.maxStack) {
+							// Consume from the list
+							if (info.stack + resultStack <= resultItem.maxStack) {
+								info = new ItemInfo(info.type, resultStack + info.stack, info.prefix);
+								resultStack = 0;
+							} else {
+								info = new ItemInfo(info.type, resultItem.maxStack, info.prefix);
+								resultStack -= resultItem.maxStack - info.stack;
+							}
+
+							storageItemInfo[i] = info;
+						}
+
+						if (resultStack <= 0)
+							break;
+					}
+
+					if (resultStack > 0)
+						storageItemInfo.Add(new ItemInfo(resultItem));
+				}
+
+				storageItemInfo = oldInfo;
+
+				NetHelper.Report(true, "Recipe passed the ingredients check");
+				return true;
+			} else {
+				bool success = PassesBlock_CheckRecipe(recipe);
+				NetHelper.Report(true, $"Recipe {(success ? "passed" : "failed")} the ingredients check");
+				return success;
+			}
+		}
+
+		private static bool PassesBlock_CheckRecipe(Recipe recipe, bool consumeStoredItems = false) {
+			foreach (Item ingredient in recipe.requiredItem) {
 				int stack = ingredient.stack;
 				bool useRecipeGroup = false;
 
-				foreach (Item item in storageItems)
-				{
-					ItemData data = new(item);
-					if (!blockStorageItems.Contains(data) && RecipeGroupMatch(recipe, item.type, ingredient.type))
-					{
+				int storageIndex = -1;
+				List<int> updatedStorageStacks = new();
+				foreach (ItemInfo item in storageItemInfo) {
+					storageIndex++;
+					updatedStorageStacks.Add(item.stack);
+
+					if (stack <= 0)
+						continue;
+
+					if (!blockStorageItems.Contains(new ItemData(item)) && RecipeGroupMatch(recipe, item.type, ingredient.type)) {
+						if (consumeStoredItems) {
+							if (item.stack >= stack)
+								updatedStorageStacks[storageIndex] -= stack;
+							else
+								updatedStorageStacks[storageIndex] = 0;
+						}
+
 						stack -= item.stack;
 						useRecipeGroup = true;
 					}
 				}
 
-				if (!useRecipeGroup)
-					foreach (Item item in storageItems)
-					{
-						ItemData data = new(item);
-						if (!blockStorageItems.Contains(data) && item.type == ingredient.type)
+				if (!useRecipeGroup) {
+					storageIndex = -1;
+					foreach (ItemInfo item in storageItemInfo) {
+						storageIndex++;
+
+						if (!blockStorageItems.Contains(new ItemData(item)) && item.type == ingredient.type) {
+							if (consumeStoredItems) {
+								if (item.stack >= stack)
+									updatedStorageStacks[storageIndex] -= stack;
+								else
+									updatedStorageStacks[storageIndex] = 0;
+							}
+
 							stack -= item.stack;
+
+							if (stack <= 0)
+								break;
+						}
 					}
+				}
+
+				// Update the list with the new stacks
+				if (consumeStoredItems) {
+					Stack<int> toRemove = new();
+
+					for (int i = 0; i < updatedStorageStacks.Count; i++) {
+						int updatedStack = updatedStorageStacks[i];
+						if (updatedStack <= 0) {
+							toRemove.Push(i);
+							continue;
+						}
+
+						ItemInfo info = storageItemInfo[i];
+						storageItemInfo[i] = new ItemInfo(info.type, updatedStack, info.prefix);
+					}
+
+					foreach (int index in toRemove)
+						storageItemInfo.RemoveAt(index);
+				}
 
 				if (stack > 0)
 					return false;
 			}
-
 
 			return true;
 		}
@@ -975,6 +1319,7 @@ namespace MagicStorage
 			NetHelper.Report(true, "Updating stored ingredients collection and result item...");
 
 			storageItems.Clear();
+			storageItemInfo = new();
 			storageItemsFromModules.Clear();
 			result = null;
 			if (selectedRecipe is null) {
@@ -984,29 +1329,31 @@ namespace MagicStorage
 
 			int index = 0;
 			bool hasItemFromStorage = false;
-			foreach (List<Item> itemsFromSource in sourceItems)
-			{
-				foreach (Item item in itemsFromSource) {
-					foreach (Item reqItem in selectedRecipe.requiredItem) {
-						if (item.type == reqItem.type || RecipeGroupMatch(selectedRecipe, item.type, reqItem.type)) {
-							//Module items must refer to the original item instances
-							storageItems.Add(index >= numItemsWithoutSimulators ? item : item.Clone());
-							storageItemsFromModules.Add(index >= numItemsWithoutSimulators);
-						}
-					}
+			if (GetCraftingTree(selectedRecipe) is not OrderedRecipeTree craftingTree) {
+				NetHelper.Report(false, "Recursion was disabled or recipe did not have a recursive recipe");
 
-					if (item.type == selectedRecipe.createItem.type) {
-						Item source = itemsFromSource[0];
-
-						if (index < numItemsWithoutSimulators) {
-							result = source;
-							hasItemFromStorage = true;
-						} else if (!hasItemFromStorage)
-							result = source;
-					}
+				foreach (List<Item> itemsFromSource in sourceItems) {
+					CheckStorageItemsForRecipe(selectedRecipe, itemsFromSource, null, checkResultItem: true, index, ref hasItemFromStorage);
+					index++;
 				}
+			} else {
+				NetHelper.Report(false, "Recipe had a recursive recipe, processing recursion tree...");
 
-				index++;
+				// Check each recipe in the tree
+				List<Recipe> recipes = craftingTree.GetAllRecipes().ToList();
+
+				foreach (List<Item> itemsFromSource in sourceItems) {
+					bool[] wasItemAdded = new bool[itemsFromSource.Count];
+					bool checkedHighestRecipe = false;
+
+					foreach (Recipe recipe in recipes) {
+						// Only allow the "final recipe" to affect the result item
+						CheckStorageItemsForRecipe(recipe, itemsFromSource, wasItemAdded, checkResultItem: !checkedHighestRecipe, index, ref hasItemFromStorage);
+						checkedHighestRecipe = true;
+					}
+
+					index++;
+				}
 			}
 
 			var resultItemList = CompactItemListWithModuleData(storageItems, storageItemsFromModules, out var moduleItemsList);
@@ -1014,6 +1361,8 @@ namespace MagicStorage
 				//Update the lists since items were compacted
 				storageItems.Clear();
 				storageItems.AddRange(resultItemList);
+				storageItemInfo.Clear();
+				storageItemInfo.AddRange(storageItems.Select(static i => new ItemInfo(i)));
 				storageItemsFromModules.Clear();
 				storageItemsFromModules.AddRange(moduleItemsList);
 			}
@@ -1023,7 +1372,40 @@ namespace MagicStorage
 			NetHelper.Report(true, $"Success! Found {storageItems.Count} items and {(result.IsAir ? "no result items" : "a result item")}");
 		}
 
-		private static bool RecipeGroupMatch(Recipe recipe, int inventoryType, int requiredType)
+		private static void CheckStorageItemsForRecipe(Recipe recipe, List<Item> itemsFromSource, bool[] wasItemAdded, bool checkResultItem, int index, ref bool hasItemFromStorage) {
+			int addedIndex = 0;
+
+			foreach (Item item in itemsFromSource) {
+				if (item.type != selectedRecipe.createItem.type && wasItemAdded?[addedIndex] is not true) {
+					foreach (Item reqItem in recipe.requiredItem) {
+						if (item.type == reqItem.type || RecipeGroupMatch(recipe, item.type, reqItem.type)) {
+							//Module items must refer to the original item instances
+							Item clone = index >= numItemsWithoutSimulators ? item : item.Clone();
+							storageItems.Add(clone);
+							storageItemInfo.Add(new(clone));
+							storageItemsFromModules.Add(index >= numItemsWithoutSimulators);
+
+							if (wasItemAdded is not null)
+								wasItemAdded[addedIndex] = true;
+						}
+					}
+				}
+
+				addedIndex++;
+
+				if (checkResultItem && item.type == recipe.createItem.type) {
+					Item source = itemsFromSource[0];
+
+					if (index < numItemsWithoutSimulators) {
+						result = source;
+						hasItemFromStorage = true;
+					} else if (!hasItemFromStorage)
+						result = source;
+				}
+			}
+		}
+
+		public static bool RecipeGroupMatch(Recipe recipe, int inventoryType, int requiredType)
 		{
 			foreach (int num in recipe.acceptedGroups)
 			{
@@ -1033,8 +1415,6 @@ namespace MagicStorage
 			}
 
 			return false;
-
-			//return recipe.useWood(type1, type2) || recipe.useSand(type1, type2) || recipe.useIronBar(type1, type2) || recipe.useFragment(type1, type2) || recipe.AcceptedByItemGroups(type1, type2) || recipe.usePressurePlate(type1, type2);
 		}
 
 		internal static void SetSelectedRecipe(Recipe recipe)
@@ -1046,8 +1426,6 @@ namespace MagicStorage
 			selectedRecipe = recipe;
 			RefreshStorageItems();
 			blockStorageItems.Clear();
-
-			SetNextDefaultRecipeCollectionToRefresh(Array.Empty<Recipe>());
 
 			NetHelper.Report(true, "Successfully reassigned current recipe!");
 		}
@@ -1223,7 +1601,19 @@ namespace MagicStorage
 		/// </summary>
 		/// <param name="toCraft">How many items should be crafted</param>
 		public static void Craft(int toCraft) {
-			NetHelper.Report(true, $"Attempting to craft {toCraft} items...");
+			NetHelper.Report(true, $"Attempting to craft {toCraft} {Lang.GetItemNameValue(selectedRecipe.createItem.type)}");
+
+			// Additional safeguard against absurdly high craft targets
+			int origCraftRequest = toCraft;
+			toCraft = Math.Min(toCraft, AmountCraftableForCurrentRecipe());
+
+			if (toCraft != origCraftRequest)
+				NetHelper.Report(false, $"Craft amount reduced to {toCraft}");
+
+			if (toCraft <= 0) {
+				NetHelper.Report(false, "Amount to craft was less than 1, aborting");
+				return;
+			}
 
 			CraftingContext context;
 			if (MagicStorageConfig.IsRecursionEnabled) {
@@ -1233,16 +1623,6 @@ namespace MagicStorage
 				if (context is null)
 					return;  // Bail
 			} else {
-				//Safeguard against absurdly high craft targets
-				int origCraftRequest = toCraft;
-				toCraft = Math.Min(toCraft, AmountCraftable(selectedRecipe));
-
-				if (toCraft != origCraftRequest)
-					NetHelper.Report(true, $"Craft amount reduced to {toCraft}");
-
-				if (toCraft <= 0)
-					return;  // Bail
-
 				context = InitCraftingContext(toCraft);
 
 				int target = toCraft;
@@ -1260,6 +1640,7 @@ namespace MagicStorage
 			NetHelper.Report(true, "Compacting results list...");
 
 			context.toWithdraw = CompactItemList(context.toWithdraw);
+			
 			context.results = CompactItemList(context.results);
 
 			if (Main.netMode == NetmodeID.SinglePlayer) {
@@ -1267,6 +1648,8 @@ namespace MagicStorage
 
 				foreach (Item item in HandleCraftWithdrawAndDeposit(GetHeart(), context.toWithdraw, context.results))
 					Main.LocalPlayer.QuickSpawnClonedItem(new EntitySource_TileEntity(GetHeart()), item, item.stack);
+
+				StorageGUI.SetRefresh();
 			} else if (Main.netMode == NetmodeID.MultiplayerClient) {
 				NetHelper.Report(true, "Sending craft results to server...");
 
@@ -1306,6 +1689,18 @@ namespace MagicStorage
 			};
 		}
 
+		private static Dictionary<int, int> GetItemCountsWithBlockedItemsRemoved(bool cloneIfBlockEmpty = false) {
+			if (!cloneIfBlockEmpty && blockStorageItems.Count == 0)
+				return itemCounts;
+
+			Dictionary<int, int> counts = new(itemCounts);
+
+			foreach (var data in blockStorageItems)
+				counts.Remove(data.Type);
+
+			return counts;
+		}
+
 		private static CraftingContext Craft_WithRecursion(int toCraft) {
 			// Unlike normal crafting, the crafting tree has to be respected
 			// This means that simple IsAvailable and AmountCraftable checks would just slow it down
@@ -1316,99 +1711,94 @@ namespace MagicStorage
 			if (toCraft <= 0)
 				return null;  // Bail
 
-			NetHelper.Report(true, "Retrieving crafting tree for recipe...");
-
-			OrderedRecipeTree order = recursiveRecipe.GetCraftingTree(toCraft);
-			CraftingContext context = InitCraftingContext(order.context.amountToCraft);
-
-			NetHelper.Report(true, "Trimming branches...");
-
-			// Go from the top of the tree down, cutting off any branches when necessary
-			Queue<OrderedRecipeTree> queue = new();
-			foreach (var leaf in order.Leaves)
-				queue.Enqueue(leaf);
-
-			Dictionary<int, List<OrderedRecipeContext>> processByDepth = new();
-			int depth, maxDepth = 0;
-			while (queue.TryDequeue(out OrderedRecipeTree branch)) {
-				// Check if the amount needed has been satisfied
-				// If it is, this recipe and its children are not needed
-				Recipe recipe = branch.context.recipe;
-
-				int result = recipe.createItem.type;
-				ref int remaining = ref branch.context.amountToCraft;
-
-				remaining -= CountItems(context, recipe, result);
-
-				depth = branch.context.depth;
-				if (remaining <= 0) {
-					NetHelper.Report(false, $"Branch trimmed: Depth = {depth}, Recipe result = {recipe.createItem.stack} {Lang.GetItemNameValue(result)}");
-
-					branch.Clear();
-				} else {
-					// Add the branch to the list of recipes to process since it's initially unfulfilled
-					if (maxDepth < depth)
-						maxDepth = depth;
-					if (!processByDepth.TryGetValue(depth, out var list))
-						processByDepth[depth] = list = new();
-
-					list.Add(branch.context);
-
-					foreach (var leaf in branch.Leaves)
-						queue.Enqueue(leaf);
-				}
-			}
+			CraftingContext context = InitCraftingContext(toCraft);
 
 			NetHelper.Report(true, "Attempting recurrent crafting...");
 
 			// Local capturing
-			int md = maxDepth;
-			var processes = processByDepth;
 			var ctx = context;
 			
 			// With the branches that are left, go from the bottom up and attempt to craft them
 			ExecuteInCraftingGuiEnvironment(() => {
-				for (int depth = md; depth >= 0; depth--) {
-					if (processes.TryGetValue(depth, out var list)) {
-						// Process the recipes
-						foreach (var recipeContext in list) {
-							int target = recipeContext.amountToCraft;
+				NetHelper.Report(true, "Retrieving materials list...");
 
-							if (target <= 0)
-								continue;
+				List<RequiredMaterialInfo> materials;
+				List<ItemInfo> excess;
+				using (FlagSwitch.ToggleTrue(ref requestingAmountFromUI))
+					materials = recursiveRecipe.GetRequiredMaterials(toCraft, out excess, GetItemCountsWithBlockedItemsRemoved());
 
-							string itemName = Lang.GetItemNameValue(recipeContext.recipe.createItem.type);
+				NetHelper.Report(true, "Attempting crafting...");
 
-							NetHelper.Report(false, $"Attempting to craft {recipeContext.amountToCraft} {itemName}");
+				// Immediately add the excess to the context's results
+				ctx.results.AddRange(excess.Where(static i => i.stack > 0).Select(static i => new Item(i.type, i.stack, i.prefix)));
 
-							Craft_DoStandardCraft(ctx);
+				// At this point, the amount to craft has already been clamped by the max amount possible
+				// Hence, just consume the items
+				List<Item> consumedItems = new();
 
-							NetHelper.Report(false, $"Crafted {target - recipeContext.amountToCraft} {itemName}");
+				ctx.simulation = true;
+
+				foreach (var m in materials) {
+					var material = m;
+
+					List<Item> origWithdraw = new(ctx.toWithdraw);
+					List<Item> origResults = new(ctx.results);
+
+					foreach (int type in material.GetValidItems()) {
+						Item item = new Item(type, material.stack);
+
+						if (!CanConsumeItem(ctx, item, origWithdraw, origResults, out bool wasAvailable, out int stackConsumed)) {
+							if (wasAvailable)
+								NetHelper.Report(false, $"Skipping consumption of item \"{Lang.GetItemNameValue(item.type)}\"");
+							else {
+								// Did not have enough items
+								NetHelper.Report(false, $"Material requirement \"{Lang.GetItemNameValue(item.type)}\" could not be met, aborting");
+								return;
+							}
+						} else {
+							// Consume the item
+							material = material.UpdateStack(-stackConsumed);
+							item.stack = stackConsumed;
+							consumedItems.Add(item);
+
+							if (material.stack <= 0)
+								break;
 						}
 					}
 				}
+
+				ctx.simulation = false;
+
+				NetHelper.Report(true, $"Recursion crafting used the following materials:\n  {
+					(consumedItems.Count > 0
+						? string.Join("\n  ", consumedItems.Select(static i => $"{i.stack} {Lang.GetItemNameValue(i.type)}"))
+						: "none")
+					}");
+
+				// Actually consume the items
+				foreach (Item item in consumedItems) {
+					int stack = item.stack;
+
+					if (!AttemptToConsumeItem(ctx, ctx.results, item.type, ref stack, addToWithdraw: false)) {
+						if (!AttemptToConsumeItem(ctx, ctx.availableItems, item.type, ref stack, addToWithdraw: true))
+							ConsumeItemFromSource(ctx, item.type, item.stack);
+					}
+				}
+
+				// Last item in the "excess results" list is always the main recipe's item
+				NetHelper.Report(true, $"Success! Crafted {excess[^1].stack} items and {excess.Count - 1} extra item types");
 			});
+
+			// Sanity check
+			selectedRecipe = recursiveRecipe.original;
 
 			return context;
 		}
 
-		private static int CountItems(CraftingContext context, Recipe recipe, int type) {
-			int sum = 0;
-
-			foreach (Item item in context.availableItems) {
-				if (item.type == type || RecipeGroupMatch(recipe, item.type, type)) {
-					// Check for overflow
-					if (sum + item.stack < 0)
-						return int.MaxValue;
-
-					sum += item.stack;
-				}
-			}
-
-			return sum;
-		}
-
 		private static void AttemptCraft(Func<CraftingContext, bool> func, CraftingContext context) {
+			// NOTE: [ThreadStatic] only runs the field initializer on one thread
+			DroppedItems ??= new();
+
 			while (context.toCraft > 0) {
 				if (!func(context))
 					break;  // Could not craft any more items
@@ -1447,8 +1837,10 @@ namespace MagicStorage
 			int crafts = (int)Math.Ceiling(context.toCraft / (float)selectedRecipe.createItem.stack);
 
 			//Skip item consumption code for recipes that have no ingredients
-			if (selectedRecipe.requiredItem.Count == 0)
+			if (selectedRecipe.requiredItem.Count == 0) {
+				NetHelper.Report(false, "Recipe had no ingredients, skipping consumption...");
 				goto SkipItemConsumption;
+			}
 
 			context.simulation = true;
 
@@ -1461,13 +1853,9 @@ namespace MagicStorage
 					clone.stack *= crafts;
 
 					if (!CanConsumeItem(context, clone, origWithdraw, origResults, out bool wasAvailable, out int stackConsumed)) {
-						if (wasAvailable) {
+						if (wasAvailable)
 							NetHelper.Report(false, $"Skipping consumption of item \"{Lang.GetItemNameValue(reqItem.type)}\". (Batching {crafts} crafts)");
-
-							// Add an "empty item" to the batch in order to allow later logic to exit the loop...
-							clone.stack = 0;
-							batch.Add(clone);
-						} else {
+						else {
 							// Did not have enough items
 							crafts--;
 							batch.Clear();
@@ -1498,11 +1886,17 @@ namespace MagicStorage
 			//Consume the batched items
 			foreach (Item item in batch) {
 				int stack = item.stack;
+
 				if (!AttemptToConsumeItem(context, context.availableItems, item.type, ref stack, addToWithdraw: true))
 					ConsumeItemFromSource(context, item.type, item.stack);
 			}
 
+			NetHelper.Report(true, $"Batch crafting used the following materials:\n  {string.Join("\n  ", batch.Select(static i => $"{i.stack} {Lang.GetItemNameValue(i.type)}"))}");
+
 			SkipItemConsumption:
+
+			// NOTE: [ThreadStatic] only runs the field initializer on one thread
+			DroppedItems ??= new();
 
 			//Create the resulting items
 			for (int i = 0; i < crafts; i++) {
@@ -1609,31 +2003,30 @@ namespace MagicStorage
 					//Don't attempt to withdraw if the item is from a module, since it doesn't exist in the storage system anyway
 					bool canWithdraw = context.simulation || (addToWithdraw && !context.fromModule[listIndex]);
 
-					if (canWithdraw) {
-						int stackToConsume;
+					int stackToConsume;
 
-						if (tryItem.stack > stack) {
-							stackToConsume = stack;
-							stack = 0;
-						} else {
-							stackToConsume = tryItem.stack;
-							stack -= tryItem.stack;
-						}
+					if (tryItem.stack > stack) {
+						stackToConsume = stack;
+						stack = 0;
+					} else {
+						stackToConsume = tryItem.stack;
+						stack -= tryItem.stack;
+					}
 
+					if (!context.simulation)
 						OnConsumeItemForRecipe_Obsolete(context, tryItem, stackToConsume);
 
-						if (!context.simulation) {
-							Item temp = tryItem.Clone();
-							temp.stack = stackToConsume;
+					if (addToWithdraw && !context.simulation && !context.fromModule[listIndex]) {
+						Item temp = tryItem.Clone();
+						temp.stack = stackToConsume;
 
-							context.toWithdraw.Add(temp);
-						}
-
-						tryItem.stack -= stackToConsume;
-
-						if (tryItem.stack <= 0)
-							tryItem.type = ItemID.None;
+						context.toWithdraw.Add(temp);
 					}
+
+					tryItem.stack -= stackToConsume;
+
+					if (tryItem.stack <= 0)
+						tryItem.type = ItemID.None;
 
 					if (stack <= 0)
 						break;

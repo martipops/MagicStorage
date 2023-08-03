@@ -29,8 +29,10 @@ public class MagicCache : ModSystem
 
 		private IEnumerable<Recipe> GetRecipes() {
 			foreach (Recipe recipe in EnabledRecipes) {
-				if (recipe.createItem.type == itemType || recipe.requiredItem.Any(i => i.type == itemType))
+				if (recipe.createItem.type == itemType || recipe.requiredItem.Any(i => i.type == itemType)) {
 					yield return recipe;
+					continue;
+				}
 
 				// Check recipe groups
 				foreach (int id in recipe.acceptedGroups) {
@@ -83,8 +85,6 @@ public class MagicCache : ModSystem
 
 		if (!Main.gameMenu && MagicUI.IsCraftingUIOpen())
 			StorageGUI.SetRefresh(forceFullRefresh: true);
-
-		// TODO: refresh recursive recipes
 	}
 
 	public override void Unload()
@@ -144,7 +144,8 @@ public class MagicCache : ModSystem
 					if (!hasIngredient.TryGetValue(item, out var list))
 						hasIngredient[item] = list = new();
 
-					list.Add(recipe);
+					if (!list.Contains(recipe))
+						list.Add(recipe);
 				}
 			}
 		}

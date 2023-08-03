@@ -1,5 +1,6 @@
 ﻿using MagicStorage.Common;
 using MagicStorage.Common.Systems;
+using MagicStorage.Common.Systems.RecurrentRecipes;
 using MagicStorage.Components;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
@@ -57,6 +58,7 @@ namespace MagicStorage.UI.States {
 
 		protected override IEnumerable<string> GetMenuOptions() {
 			yield return "Crafting";
+		//	yield return "Tree";
 			yield return "Sorting";
 			yield return "Filtering";
 		}
@@ -64,6 +66,7 @@ namespace MagicStorage.UI.States {
 		protected override BaseStorageUIPage InitPage(string page)
 			=> page switch {
 				"Crafting" => new RecipesPage(this),
+			//	"Tree" => new RecursiveTreeViewPage(this),
 				"Sorting" => new SortingPage(this),
 				"Filtering" => new FilteringPage(this),
 				_ => throw new ArgumentException("Unknown page: " + page, nameof(page))
@@ -134,15 +137,21 @@ namespace MagicStorage.UI.States {
 					if (obj.slot >= CraftingGUI.selectedRecipe.requiredItem.Count)
 						return;
 
+					// Right click will do nothing when recursive crafting is enabled, since it would be pointless
+					if (MagicStorageConfig.IsRecursionEnabled)
+						return;
+
 					// select ingredient recipe by right clicking
 					Item item = CraftingGUI.selectedRecipe.requiredItem[obj.slot];
 					if (MagicCache.ResultToRecipe.TryGetValue(item.type, out var itemRecipes) && itemRecipes.Length > 0) {
 						Recipe selected = itemRecipes[0];
 
-						foreach (Recipe r in itemRecipes[1..]) {
-							if (CraftingGUI.IsAvailable(r)) {
-								selected = r;
-								break;
+						using (FlagSwitch.ToggleTrue(ref CraftingGUI.disableNetPrintingForIsAvailable)) {
+							foreach (Recipe r in itemRecipes[1..]) {
+								if (CraftingGUI.IsAvailable(r)) {
+									selected = r;
+									break;
+								}
 							}
 						}
 
@@ -205,6 +214,9 @@ namespace MagicStorage.UI.States {
 						CraftingGUI.blockStorageItems.Remove(data);
 					else
 						CraftingGUI.blockStorageItems.Add(data);
+
+					// Force the "recipe available" logic to update
+					CraftingGUI.ResetRecentRecipeCache();
 
 					storageZone.SetItemsAndContexts(int.MaxValue, GetStorage);
 				};
@@ -681,23 +693,48 @@ namespace MagicStorage.UI.States {
 					isEmpty = false;
 				}
 
-				foreach (int tile in CraftingGUI.selectedRecipe.requiredTile)
+				IEnumerable<int> requiredTiles;
+				OrderedRecipeTree craftingTree = null;
+				if (CraftingGUI.GetCraftingTree(CraftingGUI.selectedRecipe) is OrderedRecipeTree tree) {
+					craftingTree = tree;
+					requiredTiles = tree.GetRequiredTiles();
+				} else
+					requiredTiles = CraftingGUI.selectedRecipe.requiredTile;
+
+				foreach (int tile in requiredTiles)
 					AddText(Lang.GetMapObjectName(MapHelper.TileToLookup(tile, 0)));
 
-				if (CraftingGUI.selectedRecipe.HasCondition(Recipe.Condition.NearWater))
-					AddText(Language.GetTextValue("LegacyInterface.53"));
+				if (craftingTree is null) {
+					if (CraftingGUI.selectedRecipe.HasCondition(Recipe.Condition.NearWater))
+						AddText(Language.GetTextValue("LegacyInterface.53"));
 
-				if (CraftingGUI.selectedRecipe.HasCondition(Recipe.Condition.NearHoney))
-					AddText(Language.GetTextValue("LegacyInterface.58"));
+					if (CraftingGUI.selectedRecipe.HasCondition(Recipe.Condition.NearHoney))
+						AddText(Language.GetTextValue("LegacyInterface.58"));
 
-				if (CraftingGUI.selectedRecipe.HasCondition(Recipe.Condition.NearLava))
-					AddText(Language.GetTextValue("LegacyInterface.56"));
+					if (CraftingGUI.selectedRecipe.HasCondition(Recipe.Condition.NearLava))
+						AddText(Language.GetTextValue("LegacyInterface.56"));
 
-				if (CraftingGUI.selectedRecipe.HasCondition(Recipe.Condition.InSnow))
-					AddText(Language.GetTextValue("LegacyInterface.123"));
+					if (CraftingGUI.selectedRecipe.HasCondition(Recipe.Condition.InSnow))
+						AddText(Language.GetTextValue("LegacyInterface.123"));
 
-				if (CraftingGUI.selectedRecipe.HasCondition(Recipe.Condition.InGraveyardBiome))
-					AddText(Language.GetTextValue("LegacyInterface.124"));
+					if (CraftingGUI.selectedRecipe.HasCondition(Recipe.Condition.InGraveyardBiome))
+						AddText(Language.GetTextValue("LegacyInterface.124"));
+				} else {
+					if (craftingTree.HasCondition(Recipe.Condition.NearWater))
+						AddText(Language.GetTextValue("LegacyInterface.53"));
+
+					if (craftingTree.HasCondition(Recipe.Condition.NearHoney))
+						AddText(Language.GetTextValue("LegacyInterface.58"));
+
+					if (craftingTree.HasCondition(Recipe.Condition.NearLava))
+						AddText(Language.GetTextValue("LegacyInterface.56"));
+
+					if (craftingTree.HasCondition(Recipe.Condition.InSnow))
+						AddText(Language.GetTextValue("LegacyInterface.123"));
+
+					if (craftingTree.HasCondition(Recipe.Condition.InGraveyardBiome))
+						AddText(Language.GetTextValue("LegacyInterface.124"));
+				}
 
 				if (isEmpty)
 					text = Language.GetTextValue("LegacyInterface.23");
@@ -794,7 +831,7 @@ namespace MagicStorage.UI.States {
 			int index = slot + CraftingGUI.IngredientColumns * (int)Math.Round(storageScrollBar.ViewPosition);
 			Item item = index < CraftingGUI.storageItems.Count ? CraftingGUI.storageItems[index] : new Item();
 			if (CraftingGUI.blockStorageItems.Contains(new ItemData(item)))
-				context = 3; // Red // ItemSlot.Context.ChestItem
+				context = ItemSlot.Context.ChestItem;  // Red
 
 			return item;
 		}
@@ -1117,23 +1154,38 @@ namespace MagicStorage.UI.States {
 					return new Item();
 
 				int index = slot + CraftingGUI.RecipeColumns * (int)Math.Round(scrollBar.ViewPosition);
-				Item item = index >= 0 && index < CraftingGUI.recipes.Count ? CraftingGUI.recipes[index].createItem : new Item();
 
-				if (!item.IsAir) {
-					// TODO can this be nicer?
-					if (CraftingGUI.recipes[index] == CraftingGUI.selectedRecipe)
-						context = 6;
+				// Fail early if the index is invalid
+				if (index < 0 || index >= CraftingGUI.recipes.Count)
+					return new Item();
 
-					if (!CraftingGUI.recipeAvailable[index])
-						context = CraftingGUI.recipes[index] == CraftingGUI.selectedRecipe ? 4 : 3;
+				try {
+					Recipe recipe = CraftingGUI.recipes[index];
+					bool available = CraftingGUI.recipeAvailable[index];
+
+					Item item = recipe.createItem;
+
+					// Air item should display as an "empty slot" without special contexts
+					if (!item.IsAir) {
+						bool selected = object.ReferenceEquals(recipe, CraftingGUI.selectedRecipe);
+
+						if (selected)
+							context = 6;
+
+						if (!available)
+							context = selected ? 4 : 3;
 					
-					if (StoragePlayer.LocalPlayer.FavoritedRecipes.Contains(item)) {
-						item = item.Clone();
-						item.favorited = true;
+						if (StoragePlayer.LocalPlayer.FavoritedRecipes.Contains(item)) {
+							item = item.Clone();
+							item.favorited = true;
+						}
 					}
-				}
 
-				return item;
+					return item;
+				} catch {
+					// Failsafe: return empty item on error
+					return new Item();
+				}
 			}
 
 			public override void GetZoneDimensions(out float top, out float bottomMargin) {
@@ -1174,7 +1226,6 @@ namespace MagicStorage.UI.States {
 							storagePlayer.FavoritedRecipes.Remove(obj.StoredItem);
 
 						StorageGUI.SetRefresh();
-						CraftingGUI.SetNextDefaultRecipeCollectionToRefresh(Array.Empty<Recipe>());
 					} else if (MagicStorageConfig.RecipeBlacklistEnabled && Main.keyState.IsKeyDown(Keys.LeftControl)) {
 						if (recipeButtons.Choice == CraftingGUI.RecipeButtonsBlacklistChoice) {
 							if (storagePlayer.HiddenRecipes.Remove(obj.StoredItem)) {
@@ -1205,6 +1256,12 @@ namespace MagicStorage.UI.States {
 
 				return Main.mouseX > parentUI.PanelLeft && Main.mouseX < parent.recipeLeft + parent.recipeWidth && Main.mouseY > parentUI.PanelTop && Main.mouseY < parentUI.PanelBottom;
 			}
+		}
+
+		public class RecursiveTreeViewPage : BaseStorageUIPage {
+			// TODO: design UI.  should this even be another page?
+
+			public RecursiveTreeViewPage(BaseStorageUI parent) : base(parent, "Tree") { }
 		}
 	}
 }
